@@ -11,7 +11,7 @@ on:
         default: DEVELOPMENT
       machine_config:
         description: xnu MACHINE_CONFIG
-        default: DREAMLTE
+        default: A5XELTE
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
@@ -36,7 +36,7 @@ jobs:
   build:
     # macos-14 still ships Xcode 15.x: its iig matches the xnu-8796 IORPC ABI
     # (Xcode 16's iig emits IORPC.kernelContent, which this xnu lacks)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -70,10 +70,11 @@ jobs:
           sudo chmod +x /usr/local/bin/xcodes
           sw_vers
           ls -d /Applications/Xcode*.app
-          XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
+          XC=/Applications/Xcode_16.4.app
           echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
           sudo xcode-select -s "$XC"
           xcodebuild -version
+          xcodebuild -version | grep -q "Xcode 16.4"
           xcrun --find iig
 
       - name: Build
@@ -128,17 +129,37 @@ jobs:
       - name: Check for ARMv8.1 LSE instructions (Cortex-A53 has none)
         if: always()
         run: |
-          for k in out/kernel.*; do
-            [ -f "$k" ] || continue
-            case "$k" in *.link|*.dSYM) continue ;; esac
-            xcrun llvm-objdump -d --no-show-raw-insn "$k" > "$k.disasm" 2>/dev/null || continue
-            # function headers + LSE mnemonics, so each hit names its function
-            grep -E '^[0-9a-f]+ <|	(cas|casa|casal|casl|casp|ldadd|ldclr|ldeor|ldset|ldsmax|ldsmin|ldumax|ldumin|stadd|stclr|steor|stset|stsmax|stsmin|stumax|stumin|swp)[a-z]*	' "$k.disasm" \
-              | awk '/^[0-9a-f]+ </{fn=$2; next} {n++; c[fn]++} END {printf "LSE instructions: %d\n", n+0; for (f in c) print c[f], f}' \
-              | sort -rn | head -40 | tee "$k.lse.txt"
+          set -euo pipefail
+          shopt -s nullglob
+          kernels=(out/kernel.*)
+          tested=0
+
+          for k in "${kernels[@]}"; do
+            case "$k" in
+              *.link|*.dSYM|*.lse.txt) continue ;;
+            esac
+
+            [[ -f "$k" ]] || continue
+            tested=1
+
+            xcrun llvm-objdump -d --no-show-raw-insn "$k" > "$k.disasm"
+
+            n=$(awk '/[[:space:]](cas|ldadd|ldclr|ldeor|ldset|ldsmax|ldsmin|ldumax|ldumin|stadd|stclr|steor|stset|stsmax|stsmin|stumax|stumin|swp)[a-z]*[[:space:]]/ { n++ } END { print n+0 }' "$k.disasm")
+
             rm -f "$k.disasm"
+
+            printf 'LSE instructions: %s\n' "$n" | tee "$k.lse.txt"
+
+            if [[ "$n" != "0" ]]; then
+              echo "ERROR: kernel contains LSE instructions: $k" >&2
+              exit 1
+            fi
           done
 
+          [[ "$tested" == "1" ]] || {
+            echo "ERROR: no kernel found to scan" >&2
+            exit 1
+          }
       - uses: actions/upload-artifact@v4
         if: always()
         with:
